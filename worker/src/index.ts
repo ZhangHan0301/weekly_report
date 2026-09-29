@@ -1,7 +1,7 @@
 interface Env {
-  APP_USERNAME: string;
-  APP_PASSWORD_HASH: string;
-  SESSION_SECRET: string;
+  APP_USERNAME?: string;
+  APP_PASSWORD_HASH?: string;
+  SESSION_SECRET?: string;
   GITHUB_TOKEN: string;
   GITHUB_OWNER: string;
   GITHUB_REPO: string;
@@ -12,6 +12,11 @@ interface Env {
 
 const encoder = new TextEncoder();
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
+const AUTH_PATH = 'data/system/auth.json';
+const authCache = new Map<
+  string,
+  { value: AuthConfig | null; expiresAt: number }
+>();
 const MAX_BODY = 1_000_000;
 const jsonHeaders = {
   'Content-Type': 'application/json; charset=utf-8',
@@ -42,6 +47,21 @@ function fromB64url(value: string) {
   const raw = atob(value.replaceAll('-', '+').replaceAll('_', '/'));
   return Uint8Array.from(raw, (c) => c.charCodeAt(0));
 }
+interface AuthConfig {
+  version: 1;
+  username: string;
+  passwordHash: string;
+  createdAt: string;
+}
+function authCacheKey(env: Env) {
+  return `${env.GITHUB_OWNER}/${env.GITHUB_REPO}@${env.GITHUB_BRANCH || 'main'}`;
+}
+function sessionSecret(env: Env) {
+  return (
+    env.SESSION_SECRET ||
+    `work-trace-session-v1:${env.GITHUB_TOKEN}:${authCacheKey(env)}`
+  );
+}
 async function hmac(value: string, secret: string) {
   const key = await crypto.subtle.importKey(
     'raw',
@@ -66,27 +86,55 @@ async function makeSession(username: string, env: Env) {
       }),
     ),
   );
-  return `${payload}.${await hmac(payload, env.SESSION_SECRET)}`;
+  return `${payload}.${await hmac(payload, sessionSecret(env))}`;
 }
-async function validSession(request: Request, env: Env) {
+async function sessionUsername(request: Request, env: Env) {
   const match = request.headers
     .get('Cookie')
     ?.match(/(?:^|;\s*)work_session=([^;]+)/);
-  if (!match) return false;
+  if (!match) return null;
   const [payload, signature] = match[1].split('.');
-  if (!payload || !signature) return false;
-  const expected = await hmac(payload, env.SESSION_SECRET);
-  if (expected.length !== signature.length) return false;
+  if (!payload || !signature) return null;
+  const expected = await hmac(payload, sessionSecret(env));
+  if (expected.length !== signature.length) return null;
   let diff = 0;
   for (let i = 0; i < expected.length; i++)
     diff |= expected.charCodeAt(i) ^ signature.charCodeAt(i);
-  if (diff) return false;
+  if (diff) return null;
   try {
     const data = JSON.parse(new TextDecoder().decode(fromB64url(payload)));
-    return data.sub === env.APP_USERNAME && data.exp > Date.now() / 1000;
+    const auth = await loadAuth(env);
+    return auth && data.sub === auth.username && data.exp > Date.now() / 1000
+      ? auth.username
+      : null;
   } catch {
-    return false;
+    return null;
   }
+}
+async function passwordHash(password: string) {
+  const iterations = 600_000;
+  const saltBytes = crypto.getRandomValues(new Uint8Array(18));
+  const salt = b64url(saltBytes);
+  const material = await crypto.subtle.importKey(
+    'raw',
+    encoder.encode(password),
+    'PBKDF2',
+    false,
+    ['deriveBits'],
+  );
+  const bits = new Uint8Array(
+    await crypto.subtle.deriveBits(
+      {
+        name: 'PBKDF2',
+        hash: 'SHA-256',
+        salt: encoder.encode(salt),
+        iterations,
+      },
+      material,
+      256,
+    ),
+  );
+  return `pbkdf2_sha256$${iterations}$${salt}$${b64url(bits)}`;
 }
 async function verifyPassword(password: string, stored: string) {
   const [algorithm, rounds, salt, expected] = stored.split('$');
@@ -174,6 +222,7 @@ function sanitizeData(value: unknown): unknown {
             'tomorrow',
             'extra',
             'content',
+            'summary',
           ].includes(k)
             ? cleanHtml(v)
             : sanitizeData(v),
@@ -185,27 +234,151 @@ function sanitizeData(value: unknown): unknown {
 function validateData(path: string, value: unknown) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const data = value as Record<string, unknown>;
-  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-  const text = (key: string, limit: number) => typeof data[key] === 'string' && (data[key] as string).length <= limit;
+  const uuid =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  const text = (key: string, limit: number) =>
+    typeof data[key] === 'string' && (data[key] as string).length <= limit;
   if (path === 'data/index.json') {
-    return data.version === 1 && Array.isArray(data.projects) && data.projects.length <= 100 &&
+    return (
+      data.version === 1 &&
+      Array.isArray(data.projects) &&
+      data.projects.length <= 100 &&
       data.projects.every((item) => {
         if (!item || typeof item !== 'object') return false;
         const project = item as Record<string, unknown>;
-        return typeof project.id === 'string' && uuid.test(project.id) && typeof project.name === 'string' &&
-          project.name.trim().length > 0 && project.name.length <= 80 && typeof project.color === 'string';
-      });
+        return (
+          typeof project.id === 'string' &&
+          uuid.test(project.id) &&
+          typeof project.name === 'string' &&
+          project.name.trim().length > 0 &&
+          project.name.length <= 80 &&
+          typeof project.color === 'string' &&
+          (!project.status ||
+            (typeof project.status === 'string' &&
+            ['planning', 'active', 'blocked', 'done'].includes(
+              project.status,
+            ))) &&
+          (project.progress === undefined ||
+            (typeof project.progress === 'number' &&
+              project.progress >= 0 &&
+              project.progress <= 100))
+        );
+      })
+    );
   }
-  const ids = path.match(/^data\/(?:weekly|daily|notes)\/([0-9a-f-]{36})(?:\/([0-9a-f-]{36}))?/i);
-  if (!ids || !text('id', 36) || !uuid.test(String(data.id)) || !text('projectId', 36) || data.projectId !== ids[1]) return false;
-  if (path.startsWith('data/weekly/')) {
-    return text('weekStart', 10) && text('title', 120) && text('completed', 200000) && text('progress', 200000) &&
-      text('risks', 200000) && text('nextPlan', 200000) && typeof data.completion === 'number' && data.completion >= 0 && data.completion <= 100;
+  const projectPath = path.match(/^data\/projects\/([0-9a-f-]{36})\.json$/i);
+  if (projectPath) {
+    const milestones = data.milestones;
+    const updates = data.updates;
+    return (
+      text('id', 36) &&
+      data.id === projectPath[1] &&
+      uuid.test(String(data.id)) &&
+      text('name', 80) &&
+      text('color', 40) &&
+      ['planning', 'active', 'blocked', 'done'].includes(String(data.status)) &&
+      typeof data.progress === 'number' &&
+      data.progress >= 0 &&
+      data.progress <= 100 &&
+      text('summary', 200000) &&
+      Array.isArray(milestones) &&
+      milestones.length <= 200 &&
+      milestones.every((entry) => {
+        if (!entry || typeof entry !== 'object') return false;
+        const item = entry as Record<string, unknown>;
+        return (
+          typeof item.id === 'string' &&
+          uuid.test(item.id) &&
+          typeof item.title === 'string' &&
+          item.title.length <= 120 &&
+          typeof item.dueDate === 'string' &&
+          item.dueDate.length <= 10 &&
+          typeof item.done === 'boolean'
+        );
+      }) &&
+      Array.isArray(updates) &&
+      updates.length <= 500 &&
+      updates.every((entry) => {
+        if (!entry || typeof entry !== 'object') return false;
+        const item = entry as Record<string, unknown>;
+        return (
+          typeof item.id === 'string' &&
+          uuid.test(item.id) &&
+          typeof item.date === 'string' &&
+          item.date.length <= 10 &&
+          typeof item.content === 'string' &&
+          item.content.length <= 200000
+        );
+      })
+    );
   }
+  const weeklyPath = path.match(
+    /^data\/weekly\/(?:([0-9a-f-]{36})\/)?\d{4}-\d{2}-\d{2}\.json$/i,
+  );
+  if (weeklyPath) {
+    const projectIds = data.projectIds;
+    const dailyEntries = data.dailyEntries;
+    const validProjects = Array.isArray(projectIds)
+      ? projectIds.length <= 100 &&
+        projectIds.every((id) => typeof id === 'string' && uuid.test(id))
+      : weeklyPath[1] && data.projectId === weeklyPath[1];
+    return (
+      text('id', 36) &&
+      uuid.test(String(data.id)) &&
+      Boolean(validProjects) &&
+      (dailyEntries === undefined ||
+        (Array.isArray(dailyEntries) &&
+          dailyEntries.length <= 7 &&
+          dailyEntries.every((entry) => {
+            if (!entry || typeof entry !== 'object') return false;
+            const item = entry as Record<string, unknown>;
+            return (
+              typeof item.date === 'string' &&
+              /^\d{4}-\d{2}-\d{2}$/.test(item.date) &&
+              ['completed', 'progress', 'risks', 'nextPlan'].every(
+                (key) =>
+                  typeof item[key] === 'string' &&
+                  (item[key] as string).length <= 20000,
+              )
+            );
+          }))) &&
+      text('weekStart', 10) &&
+      text('title', 120) &&
+      text('completed', 200000) &&
+      text('progress', 200000) &&
+      text('risks', 200000) &&
+      text('nextPlan', 200000) &&
+      typeof data.completion === 'number' &&
+      data.completion >= 0 &&
+      data.completion <= 100
+    );
+  }
+  const ids = path.match(
+    /^data\/(?:daily|notes)\/([0-9a-f-]{36})(?:\/([0-9a-f-]{36}))?/i,
+  );
+  if (
+    !ids ||
+    !text('id', 36) ||
+    !uuid.test(String(data.id)) ||
+    !text('projectId', 36) ||
+    data.projectId !== ids[1]
+  )
+    return false;
   if (path.startsWith('data/daily/')) {
-    return text('date', 10) && text('completed', 200000) && text('findings', 200000) && text('tomorrow', 200000) && text('extra', 200000);
+    return (
+      text('date', 10) &&
+      text('completed', 200000) &&
+      text('findings', 200000) &&
+      text('tomorrow', 200000) &&
+      text('extra', 200000)
+    );
   }
-  return text('title', 120) && text('content', 200000) && typeof data.pinned === 'boolean' && data.id === ids[2];
+  return (
+    text('title', 120) &&
+    text('content', 200000) &&
+    typeof data.pinned === 'boolean' &&
+    data.id === ids[2]
+  );
 }
 function validPath(path: string, list = false) {
   if (
@@ -217,8 +390,9 @@ function validPath(path: string, list = false) {
     return false;
   if (path === 'data/index.json') return !list;
   return list
-    ? /^data\/(weekly|daily|notes)\/[0-9a-f-]{36}$/.test(path)
-    : /^data\/(projects\/[0-9a-f-]{36}|(weekly|daily)\/[0-9a-f-]{36}\/\d{4}-\d{2}-\d{2}|notes\/[0-9a-f-]{36}\/[0-9a-f-]{36})\.json$/.test(
+    ? /^data\/weekly$/.test(path) ||
+        /^data\/(weekly|daily|notes)\/[0-9a-f-]{36}$/.test(path)
+    : /^data\/(projects\/[0-9a-f-]{36}|weekly\/(?:[0-9a-f-]{36}\/)?\d{4}-\d{2}-\d{2}|daily\/[0-9a-f-]{36}\/\d{4}-\d{2}-\d{2}|notes\/[0-9a-f-]{36}\/[0-9a-f-]{36})\.json$/.test(
         path,
       );
 }
@@ -232,6 +406,67 @@ async function github(path: string, env: Env, init?: RequestInit) {
   headers.set('X-GitHub-Api-Version', '2022-11-28');
   headers.set('User-Agent', 'work-trace-worker');
   return fetch(githubUrl(path, env), { ...init, headers });
+}
+async function loadAuth(env: Env, fresh = false): Promise<AuthConfig | null> {
+  const key = authCacheKey(env);
+  const cached = authCache.get(key);
+  if (!fresh && cached && cached.expiresAt > Date.now()) return cached.value;
+  const gh = await github(AUTH_PATH, env);
+  let value: AuthConfig | null = null;
+  if (gh.ok) {
+    const file = (await gh.json()) as { content: string };
+    const parsed = JSON.parse(decodeContent(file.content)) as AuthConfig;
+    if (
+      parsed.version !== 1 ||
+      typeof parsed.username !== 'string' ||
+      typeof parsed.passwordHash !== 'string'
+    )
+      throw new Error('invalid auth config');
+    value = parsed;
+  } else if (gh.status === 404 && env.APP_USERNAME && env.APP_PASSWORD_HASH) {
+    value = {
+      version: 1,
+      username: env.APP_USERNAME,
+      passwordHash: env.APP_PASSWORD_HASH,
+      createdAt: 'legacy',
+    };
+  } else if (gh.status !== 404) {
+    throw new Error('github auth read failed');
+  }
+  authCache.set(key, { value, expiresAt: Date.now() + 60_000 });
+  return value;
+}
+async function createAuth(
+  username: string,
+  password: string,
+  env: Env,
+): Promise<AuthConfig> {
+  const existing = await loadAuth(env, true);
+  if (existing) throw new Response('already initialized', { status: 409 });
+  const value: AuthConfig = {
+    version: 1,
+    username,
+    passwordHash: await passwordHash(password),
+    createdAt: new Date().toISOString(),
+  };
+  const gh = await github(AUTH_PATH, env, {
+    method: 'PUT',
+    body: JSON.stringify({
+      message: '初始化工作留迹管理员账号',
+      content: encodeContent(value),
+      branch: env.GITHUB_BRANCH || 'main',
+    }),
+  });
+  if (!gh.ok) {
+    if (gh.status === 409 || gh.status === 422)
+      throw new Response('already initialized', { status: 409 });
+    throw new Error('github auth write failed');
+  }
+  authCache.set(authCacheKey(env), {
+    value,
+    expiresAt: Date.now() + 60_000,
+  });
+  return value;
 }
 function decodeContent(content: string) {
   const binary = atob(content.replace(/\n/g, ''));
@@ -277,6 +512,39 @@ const worker = {
     if (!url.pathname.startsWith('/api/'))
       return response({ error: '未找到' }, 404, headers);
     try {
+      if (url.pathname === '/api/setup-status' && request.method === 'GET') {
+        const auth = await loadAuth(env);
+        return response({ needsSetup: !auth }, 200, headers);
+      }
+      if (url.pathname === '/api/setup' && request.method === 'POST') {
+        if (!requireOrigin(request, env))
+          return response({ error: '禁止的来源' }, 403, headers);
+        const input = (await body(request)) as {
+          username?: string;
+          password?: string;
+        };
+        const username =
+          typeof input.username === 'string' ? input.username.trim() : '';
+        if (
+          username.length < 1 ||
+          username.length > 80 ||
+          typeof input.password !== 'string' ||
+          input.password.length < 10 ||
+          input.password.length > 200
+        )
+          return response(
+            { error: '用户名不能为空，密码至少需要 10 位' },
+            400,
+            headers,
+          );
+        const auth = await createAuth(username, input.password, env);
+        const token = await makeSession(auth.username, env);
+        const age = Number(env.SESSION_MAX_AGE || 604800);
+        return response({ authenticated: true, username: auth.username }, 201, {
+          ...headers,
+          'Set-Cookie': `work_session=${token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${age}`,
+        });
+      }
       if (url.pathname === '/api/login' && request.method === 'POST') {
         if (!requireOrigin(request, env))
           return response({ error: '禁止的来源' }, 403, headers);
@@ -289,13 +557,15 @@ const worker = {
           username?: string;
           password?: string;
         };
+        const auth = await loadAuth(env);
         const ok =
+          Boolean(auth) &&
           typeof input.username === 'string' &&
           typeof input.password === 'string' &&
           input.username.length <= 80 &&
           input.password.length <= 200 &&
-          input.username === env.APP_USERNAME &&
-          (await verifyPassword(input.password, env.APP_PASSWORD_HASH));
+          input.username === auth?.username &&
+          (await verifyPassword(input.password, auth?.passwordHash || ''));
         if (!ok) {
           loginAttempts.set(key, {
             count:
@@ -305,10 +575,10 @@ const worker = {
           return response({ error: '用户名或密码错误' }, 401, headers);
         }
         loginAttempts.delete(key);
-        const token = await makeSession(env.APP_USERNAME, env);
+        const token = await makeSession(auth!.username, env);
         const age = Number(env.SESSION_MAX_AGE || 604800);
         return response(
-          { authenticated: true, username: env.APP_USERNAME },
+          { authenticated: true, username: auth!.username },
           200,
           {
             ...headers,
@@ -316,18 +586,20 @@ const worker = {
           },
         );
       }
-      if (url.pathname === '/api/session' && request.method === 'GET')
+      if (url.pathname === '/api/session' && request.method === 'GET') {
+        const username = await sessionUsername(request, env);
+        const auth = await loadAuth(env);
         return response(
           {
-            authenticated: await validSession(request, env),
-            username: (await validSession(request, env))
-              ? env.APP_USERNAME
-              : undefined,
+            authenticated: Boolean(username),
+            username: username || undefined,
+            needsSetup: !auth,
           },
           200,
           headers,
         );
-      if (!(await validSession(request, env)))
+      }
+      if (!(await sessionUsername(request, env)))
         return response({ error: '请先登录' }, 401, headers);
       if (url.pathname === '/api/logout' && request.method === 'POST') {
         if (!requireOrigin(request, env))
@@ -469,7 +741,9 @@ const worker = {
                 ? '请求体过大'
                 : error.status === 415
                   ? '仅支持 JSON'
-                  : '请求无效',
+                  : error.status === 409
+                    ? '账号已经设置，请直接登录'
+                    : '请求无效',
           },
           error.status,
           headers,

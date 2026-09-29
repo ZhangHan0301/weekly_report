@@ -37,6 +37,7 @@ next-env.d.ts
 /.wrangler/
 /outputs/
 /work/
+/.local-data/
 .env
 .env.local
 .env.*.local
