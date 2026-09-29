@@ -1,0 +1,6 @@
+name = "work-trace-api"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+
+[vars]
+SESSION_MAX_AGE = "604800"
