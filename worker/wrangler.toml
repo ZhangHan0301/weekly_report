@@ -1,6 +1,12 @@
 name = "work-trace-api"
 main = "src/index.ts"
-compatibility_date = "2026-09-01"
+compatibility_date = "2026-05-22"
 
 [vars]
 SESSION_MAX_AGE = "604800"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "work-trace-data"
+database_id = "8a02f253-3699-4fa0-80fd-614214e91799"
+migrations_dir = "migrations"

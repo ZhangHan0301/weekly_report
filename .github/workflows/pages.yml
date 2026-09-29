@@ -22,7 +22,7 @@ jobs:
       - run: npm ci
       - run: npm run build:pages
         env:
-          NEXT_PUBLIC_API_BASE: ${{ vars.NEXT_PUBLIC_API_BASE }}
+          NEXT_PUBLIC_API_BASE: https://work-trace-api.1281311575.workers.dev
           GITHUB_PAGES: 'true'
       - uses: actions/upload-pages-artifact@v3
         with:

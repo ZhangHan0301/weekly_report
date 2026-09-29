@@ -1,6 +1,21 @@
 import type { RemoteFile } from './models';
 
-const API_BASE = (process.env.NEXT_PUBLIC_API_BASE || '').replace(/\/$/, '');
+export type StorageMode = 'local' | 'cloud';
+
+const localApiBase = (
+  process.env.NEXT_PUBLIC_LOCAL_API_BASE || 'http://localhost:8787'
+).replace(/\/$/, '');
+const configuredApiBase = (process.env.NEXT_PUBLIC_API_BASE || '').replace(
+  /\/$/,
+  '',
+);
+const cloudApiBase = (
+  process.env.NEXT_PUBLIC_CLOUD_API_BASE ||
+  (configuredApiBase.includes('localhost') ? '' : configuredApiBase)
+).replace(/\/$/, '');
+let storageMode: StorageMode = 'local';
+
+const apiBase = () => (storageMode === 'local' ? localApiBase : cloudApiBase);
 
 export class ApiError extends Error {
   status: number;
@@ -13,10 +28,13 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const base = apiBase();
+  if (!base)
+    throw new ApiError('尚未配置 Cloudflare 云端服务地址', 503, 'CLOUD_NOT_CONFIGURED');
   const headers = new Headers(init?.headers);
   if (init?.body && !headers.has('Content-Type'))
     headers.set('Content-Type', 'application/json');
-  const response = await fetch(`${API_BASE}/api${path}`, {
+  const response = await fetch(`${base}/api${path}`, {
     credentials: 'include',
     ...init,
     headers,
@@ -35,6 +53,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  setStorageMode: (mode: StorageMode) => {
+    storageMode = mode;
+  },
+  cloudConfigured: () => Boolean(cloudApiBase),
   session: () =>
     request<{
       authenticated: boolean;

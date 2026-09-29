@@ -1,22 +1,12 @@
 interface Env {
-  APP_USERNAME?: string;
-  APP_PASSWORD_HASH?: string;
-  SESSION_SECRET?: string;
-  GITHUB_TOKEN: string;
-  GITHUB_OWNER: string;
-  GITHUB_REPO: string;
-  GITHUB_BRANCH: string;
+  DB: D1Database;
+  SESSION_SECRET: string;
   ALLOWED_ORIGIN: string;
   SESSION_MAX_AGE?: string;
 }
 
 const encoder = new TextEncoder();
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
-const AUTH_PATH = 'data/system/auth.json';
-const authCache = new Map<
-  string,
-  { value: AuthConfig | null; expiresAt: number }
->();
 const MAX_BODY = 1_000_000;
 const jsonHeaders = {
   'Content-Type': 'application/json; charset=utf-8',
@@ -53,14 +43,10 @@ interface AuthConfig {
   passwordHash: string;
   createdAt: string;
 }
-function authCacheKey(env: Env) {
-  return `${env.GITHUB_OWNER}/${env.GITHUB_REPO}@${env.GITHUB_BRANCH || 'main'}`;
-}
 function sessionSecret(env: Env) {
-  return (
-    env.SESSION_SECRET ||
-    `work-trace-session-v1:${env.GITHUB_TOKEN}:${authCacheKey(env)}`
-  );
+  if (!env.SESSION_SECRET || env.SESSION_SECRET.length < 32)
+    throw new Error('SESSION_SECRET is missing or too short');
+  return env.SESSION_SECRET;
 }
 async function hmac(value: string, secret: string) {
   const key = await crypto.subtle.importKey(
@@ -396,52 +382,18 @@ function validPath(path: string, list = false) {
         path,
       );
 }
-function githubUrl(path: string, env: Env) {
-  return `https://api.github.com/repos/${encodeURIComponent(env.GITHUB_OWNER)}/${encodeURIComponent(env.GITHUB_REPO)}/contents/${path.split('/').map(encodeURIComponent).join('/')}?ref=${encodeURIComponent(env.GITHUB_BRANCH || 'main')}`;
-}
-async function github(path: string, env: Env, init?: RequestInit) {
-  const headers = new Headers(init?.headers);
-  headers.set('Accept', 'application/vnd.github+json');
-  headers.set('Authorization', `Bearer ${env.GITHUB_TOKEN}`);
-  headers.set('X-GitHub-Api-Version', '2022-11-28');
-  headers.set('User-Agent', 'work-trace-worker');
-  return fetch(githubUrl(path, env), { ...init, headers });
-}
-async function loadAuth(env: Env, fresh = false): Promise<AuthConfig | null> {
-  const key = authCacheKey(env);
-  const cached = authCache.get(key);
-  if (!fresh && cached && cached.expiresAt > Date.now()) return cached.value;
-  const gh = await github(AUTH_PATH, env);
-  let value: AuthConfig | null = null;
-  if (gh.ok) {
-    const file = (await gh.json()) as { content: string };
-    const parsed = JSON.parse(decodeContent(file.content)) as AuthConfig;
-    if (
-      parsed.version !== 1 ||
-      typeof parsed.username !== 'string' ||
-      typeof parsed.passwordHash !== 'string'
-    )
-      throw new Error('invalid auth config');
-    value = parsed;
-  } else if (gh.status === 404 && env.APP_USERNAME && env.APP_PASSWORD_HASH) {
-    value = {
-      version: 1,
-      username: env.APP_USERNAME,
-      passwordHash: env.APP_PASSWORD_HASH,
-      createdAt: 'legacy',
-    };
-  } else if (gh.status !== 404) {
-    throw new Error('github auth read failed');
-  }
-  authCache.set(key, { value, expiresAt: Date.now() + 60_000 });
-  return value;
+async function loadAuth(env: Env): Promise<AuthConfig | null> {
+  const row = await env.DB.prepare(
+    'SELECT username, password_hash AS passwordHash, created_at AS createdAt FROM auth_config WHERE id = 1',
+  ).first<Omit<AuthConfig, 'version'>>();
+  return row ? { version: 1, ...row } : null;
 }
 async function createAuth(
   username: string,
   password: string,
   env: Env,
 ): Promise<AuthConfig> {
-  const existing = await loadAuth(env, true);
+  const existing = await loadAuth(env);
   if (existing) throw new Response('already initialized', { status: 409 });
   const value: AuthConfig = {
     version: 1,
@@ -449,36 +401,14 @@ async function createAuth(
     passwordHash: await passwordHash(password),
     createdAt: new Date().toISOString(),
   };
-  const gh = await github(AUTH_PATH, env, {
-    method: 'PUT',
-    body: JSON.stringify({
-      message: '初始化工作留迹管理员账号',
-      content: encodeContent(value),
-      branch: env.GITHUB_BRANCH || 'main',
-    }),
-  });
-  if (!gh.ok) {
-    if (gh.status === 409 || gh.status === 422)
-      throw new Response('already initialized', { status: 409 });
-    throw new Error('github auth write failed');
-  }
-  authCache.set(authCacheKey(env), {
-    value,
-    expiresAt: Date.now() + 60_000,
-  });
+  const result = await env.DB.prepare(
+    'INSERT OR IGNORE INTO auth_config (id, username, password_hash, created_at) VALUES (1, ?, ?, ?)',
+  )
+    .bind(value.username, value.passwordHash, value.createdAt)
+    .run();
+  if (result.meta.changes !== 1)
+    throw new Response('already initialized', { status: 409 });
   return value;
-}
-function decodeContent(content: string) {
-  const binary = atob(content.replace(/\n/g, ''));
-  const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
-  return new TextDecoder().decode(bytes);
-}
-function encodeContent(data: unknown) {
-  const bytes = encoder.encode(JSON.stringify(data, null, 2) + '\n');
-  let binary = '';
-  for (let i = 0; i < bytes.length; i += 8192)
-    binary += String.fromCharCode(...bytes.subarray(i, i + 8192));
-  return btoa(binary);
 }
 async function body(request: Request) {
   if (
@@ -501,6 +431,10 @@ function requireOrigin(request: Request, env: Env) {
 const worker = {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    const cookieSecurity =
+      url.protocol === 'https:'
+        ? '; Secure; SameSite=None; Partitioned'
+        : '; SameSite=Lax';
     const headers = cors(env);
     if (
       request.headers.get('Origin') &&
@@ -542,7 +476,7 @@ const worker = {
         const age = Number(env.SESSION_MAX_AGE || 604800);
         return response({ authenticated: true, username: auth.username }, 201, {
           ...headers,
-          'Set-Cookie': `work_session=${token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${age}`,
+          'Set-Cookie': `work_session=${token}; HttpOnly${cookieSecurity}; Path=/; Max-Age=${age}`,
         });
       }
       if (url.pathname === '/api/login' && request.method === 'POST') {
@@ -582,7 +516,7 @@ const worker = {
           200,
           {
             ...headers,
-            'Set-Cookie': `work_session=${token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${age}`,
+            'Set-Cookie': `work_session=${token}; HttpOnly${cookieSecurity}; Path=/; Max-Age=${age}`,
           },
         );
       }
@@ -607,27 +541,30 @@ const worker = {
         return response({ ok: true }, 200, {
           ...headers,
           'Set-Cookie':
-            'work_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0',
+            `work_session=; HttpOnly${cookieSecurity}; Path=/; Max-Age=0`,
         });
       }
       if (url.pathname === '/api/list' && request.method === 'GET') {
         const path = url.searchParams.get('path') || '';
         if (!validPath(path, true))
           return response({ error: '无效路径' }, 400, headers);
-        const gh = await github(path, env);
-        if (gh.status === 404) return response({ items: [] }, 200, headers);
-        if (!gh.ok) return response({ error: 'GitHub 读取失败' }, 502, headers);
-        const items = (await gh.json()) as {
-          name: string;
-          path: string;
-          sha: string;
-          type: string;
-        }[];
+        const rows = await env.DB.prepare(
+          'SELECT path, version FROM records WHERE path LIKE ? ORDER BY path',
+        )
+          .bind(`${path}/%`)
+          .all<{ path: string; version: number }>();
         return response(
           {
-            items: items
-              .filter((i) => i.type === 'file' && i.name.endsWith('.json'))
-              .map(({ name, path, sha }) => ({ name, path, sha })),
+            items: rows.results
+              .filter((item) => {
+                const remainder = item.path.slice(path.length + 1);
+                return !remainder.includes('/') && remainder.endsWith('.json');
+              })
+              .map((item) => ({
+                name: item.path.split('/').at(-1) || item.path,
+                path: item.path,
+                sha: String(item.version),
+              })),
           },
           200,
           headers,
@@ -637,20 +574,18 @@ const worker = {
         const path = url.searchParams.get('path') || '';
         if (!validPath(path))
           return response({ error: '无效路径' }, 400, headers);
-        const gh = await github(path, env);
-        if (gh.status === 404)
+        const record = await env.DB.prepare(
+          'SELECT data, version FROM records WHERE path = ?',
+        )
+          .bind(path)
+          .first<{ data: string; version: number }>();
+        if (!record)
           return response({ error: '记录不存在' }, 404, headers);
-        if (!gh.ok) return response({ error: 'GitHub 读取失败' }, 502, headers);
-        const file = (await gh.json()) as {
-          content: string;
-          sha: string;
-          path: string;
-        };
         return response(
           {
-            data: sanitizeData(JSON.parse(decodeContent(file.content))),
-            sha: file.sha,
-            path: file.path,
+            data: sanitizeData(JSON.parse(record.data)),
+            sha: String(record.version),
+            path,
           },
           200,
           headers,
@@ -672,29 +607,46 @@ const worker = {
           !validateData(input.path, input.data)
         )
           return response({ error: '无效请求' }, 400, headers);
-        const existing = await github(input.path, env);
-        if (existing.ok) {
-          const remote = (await existing.json()) as { sha: string };
-          if (!input.sha || input.sha !== remote.sha)
+        const existing = await env.DB.prepare(
+          'SELECT version FROM records WHERE path = ?',
+        )
+          .bind(input.path)
+          .first<{ version: number }>();
+        const data = JSON.stringify(sanitizeData(input.data));
+        const updatedAt = new Date().toISOString();
+        if (existing) {
+          if (!input.sha || input.sha !== String(existing.version))
             return response(
               { error: '远程文件已变化', code: 'REMOTE_CONFLICT' },
               409,
               headers,
             );
-        } else if (existing.status !== 404)
-          return response({ error: 'GitHub 检查失败' }, 502, headers);
-        const gh = await github(input.path, env, {
-          method: 'PUT',
-          body: JSON.stringify({
-            message: input.message || '更新工作记录',
-            content: encodeContent(sanitizeData(input.data)),
-            sha: input.sha || undefined,
-            branch: env.GITHUB_BRANCH || 'main',
-          }),
-        });
-        if (!gh.ok) return response({ error: 'GitHub 保存失败' }, 502, headers);
-        const saved = (await gh.json()) as { content: { sha: string } };
-        return response({ sha: saved.content.sha }, 200, headers);
+          const nextVersion = existing.version + 1;
+          const result = await env.DB.prepare(
+            'UPDATE records SET data = ?, version = ?, updated_at = ? WHERE path = ? AND version = ?',
+          )
+            .bind(data, nextVersion, updatedAt, input.path, existing.version)
+            .run();
+          if (result.meta.changes !== 1)
+            return response(
+              { error: '远程内容已变化', code: 'REMOTE_CONFLICT' },
+              409,
+              headers,
+            );
+          return response({ sha: String(nextVersion) }, 200, headers);
+        }
+        const result = await env.DB.prepare(
+          'INSERT OR IGNORE INTO records (path, data, version, updated_at) VALUES (?, ?, 1, ?)',
+        )
+          .bind(input.path, data, updatedAt)
+          .run();
+        if (result.meta.changes !== 1)
+          return response(
+            { error: '远程内容已变化', code: 'REMOTE_CONFLICT' },
+            409,
+            headers,
+          );
+        return response({ sha: '1' }, 200, headers);
       }
       if (url.pathname === '/api/data' && request.method === 'DELETE') {
         if (!requireOrigin(request, env))
@@ -710,25 +662,25 @@ const worker = {
           typeof input.message !== 'string'
         )
           return response({ error: '无效请求' }, 400, headers);
-        const existing = await github(input.path, env);
-        if (!existing.ok)
-          return response({ error: '记录不存在' }, 404, headers);
-        const remote = (await existing.json()) as { sha: string };
-        if (remote.sha !== input.sha)
-          return response(
-            { error: '远程文件已变化', code: 'REMOTE_CONFLICT' },
-            409,
-            headers,
-          );
-        const gh = await github(input.path, env, {
-          method: 'DELETE',
-          body: JSON.stringify({
-            message: input.message,
-            sha: input.sha,
-            branch: env.GITHUB_BRANCH || 'main',
-          }),
-        });
-        if (!gh.ok) return response({ error: 'GitHub 删除失败' }, 502, headers);
+        const result = await env.DB.prepare(
+          'DELETE FROM records WHERE path = ? AND version = ?',
+        )
+          .bind(input.path, Number(input.sha))
+          .run();
+        if (result.meta.changes !== 1) {
+          const exists = await env.DB.prepare(
+            'SELECT 1 AS found FROM records WHERE path = ?',
+          )
+            .bind(input.path)
+            .first();
+          return exists
+            ? response(
+                { error: '远程内容已变化', code: 'REMOTE_CONFLICT' },
+                409,
+                headers,
+              )
+            : response({ error: '记录不存在' }, 404, headers);
+        }
         return response({ ok: true }, 200, headers);
       }
       return response({ error: '未找到' }, 404, headers);

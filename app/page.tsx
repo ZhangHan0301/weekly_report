@@ -9,6 +9,7 @@ import {
   CircleOff,
   Cloud,
   FolderKanban,
+  HardDrive,
   Link2,
   LogOut,
   Milestone as MilestoneIcon,
@@ -21,7 +22,7 @@ import {
   WifiOff,
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ApiError, api } from '@/lib/api';
+import { ApiError, api, type StorageMode } from '@/lib/api';
 import {
   emptyProject,
   emptyWeekly,
@@ -125,7 +126,20 @@ const textToHtml = (value: string) =>
     .replaceAll('>', '&gt;')
     .replaceAll('\n', '<br>');
 
-function Login({ onLogin }: { onLogin: (username: string) => void }) {
+function StorageChoice({ error, onSelect }: { error: string; onSelect: (mode: StorageMode) => void }) {
+  const cloudReady = api.cloudConfigured();
+  return <main className="login-screen"><section className="storage-choice-card">
+    <div className="login-brand"><span className="brand-mark">迹</span><div><strong>工作留迹</strong><span>选择数据保存位置</span></div></div>
+    <div className="login-copy"><h1>这次使用哪份数据？</h1><p>本机与云端相互独立，切换不会覆盖另一边的记录。</p></div>
+    {error && <p className="form-error storage-error">{error}</p>}
+    <div className="storage-options">
+      <button onClick={() => onSelect('local')}><span className="storage-icon local"><HardDrive /></span><strong>保存到本机</strong><p>使用当前电脑的 .local-data，需要启动本地数据服务。</p><small>无需注册任何云端账号</small></button>
+      <button disabled={!cloudReady} onClick={() => onSelect('cloud')}><span className="storage-icon cloud"><Cloud /></span><strong>保存到 Cloudflare</strong><p>使用 D1 云数据库，可在多台设备访问同一份数据。</p><small>{cloudReady ? '需要已部署的 Cloudflare 服务' : '部署并配置云端地址后可用'}</small></button>
+    </div>
+  </section></main>;
+}
+
+function Login({ mode, onLogin }: { mode: StorageMode; onLogin: (username: string) => void }) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
@@ -157,13 +171,13 @@ function Login({ onLogin }: { onLogin: (username: string) => void }) {
           {error && <p className="form-error">{error}</p>}
           <Button disabled={busy} size="lg" type="submit">{busy ? '正在验证…' : '登录'}</Button>
         </form>
-        <div className="security-note"><Cloud /><span>账号由服务端安全验证<br />本地运行时，数据只保存在本机</span></div>
+        <div className="security-note">{mode === 'local' ? <HardDrive /> : <Cloud />}<span>账号由服务端安全验证<br />当前数据保存在{mode === 'local' ? '这台电脑' : ' Cloudflare D1'}</span></div>
       </section>
     </main>
   );
 }
 
-function AccountSetup({ onReady }: { onReady: (username: string) => void }) {
+function AccountSetup({ mode, onReady }: { mode: StorageMode; onReady: (username: string) => void }) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [confirmation, setConfirmation] = useState('');
@@ -196,13 +210,15 @@ function AccountSetup({ onReady }: { onReady: (username: string) => void }) {
           {error && <p className="form-error">{error}</p>}
           <Button disabled={busy} size="lg" type="submit">{busy ? '正在创建…' : '创建账号并进入'}</Button>
         </form>
-        <div className="security-note"><Cloud /><span>密码只保存强哈希，不保存明文<br />本地使用无需填写 GitHub 信息</span></div>
+        <div className="security-note">{mode === 'local' ? <HardDrive /> : <Cloud />}<span>密码只保存强哈希，不保存明文<br />账号仅用于当前{mode === 'local' ? '本机数据' : ' Cloudflare 数据库'}</span></div>
       </section>
     </main>
   );
 }
 
 export default function Home() {
+  const [storageMode, setStorageMode] = useState<'choose' | StorageMode>('choose');
+  const [storageError, setStorageError] = useState('');
   const [auth, setAuth] = useState<'loading' | 'setup' | 'out' | 'in'>('loading');
   const [username, setUsername] = useState('');
   const [view, setView] = useState<'projects' | 'weekly'>('projects');
@@ -236,7 +252,15 @@ export default function Home() {
     }
   }, []);
 
-  useEffect(() => {
+  const connectStorage = (mode: StorageMode) => {
+    api.setStorageMode(mode);
+    setStorageMode(mode);
+    setStorageError('');
+    setAuth('loading');
+    setIndexFile({ data: { version: 1, projects: [] }, sha: null, path: 'data/index.json' });
+    setProjectId('');
+    setProjectFile(null);
+    setWeekly(null);
     api.session().then((session) => {
       if (session.needsSetup) setAuth('setup');
       else if (session.authenticated) {
@@ -244,8 +268,11 @@ export default function Home() {
         setUsername(session.username || '');
         void loadIndex();
       } else setAuth('out');
-    }).catch(() => setAuth('out'));
-  }, [loadIndex]);
+    }).catch(() => {
+      setStorageMode('choose');
+      setStorageError(mode === 'local' ? '无法连接本机数据服务，请先运行 npm run worker:dev。' : '无法连接 Cloudflare 云端服务，请检查部署地址。');
+    });
+  };
 
   useEffect(() => {
     if (auth !== 'in') return;
@@ -255,7 +282,7 @@ export default function Home() {
         if (view === 'projects') {
           if (!project) { setProjectFile(null); return; }
           const path = `data/projects/${project.id}.json`;
-          const local = draft<ProjectRecord>(`draft:${path}`);
+          const local = draft<ProjectRecord>(`${storageMode}:draft:${path}`);
           try {
             const file = await api.read<ProjectRecord>(path);
             setProjectFile({ ...file, data: local || { ...emptyProject(project), ...file.data, ...normalizeProject(file.data) } });
@@ -265,7 +292,7 @@ export default function Home() {
           }
         } else {
           const path = `data/weekly/${week}.json`;
-          const local = draft<WeeklyRecord>(`draft:${path}`);
+          const local = draft<WeeklyRecord>(`${storageMode}:draft:${path}`);
           try {
             const file = await api.read<WeeklyRecord>(path);
             setWeekly(normalizeWeekly(local || file.data, week));
@@ -294,18 +321,18 @@ export default function Home() {
       }
     };
     void run();
-  }, [auth, view, projectId, project, week, indexFile.data.projects]);
+  }, [auth, view, projectId, project, week, indexFile.data.projects, storageMode]);
 
   useEffect(() => {
     if (loadingRef.current || auth !== 'in') return;
     const timer = window.setTimeout(() => {
-      if (view === 'projects' && projectFile) localStorage.setItem(`draft:${projectFile.path}`, JSON.stringify(projectFile.data));
-      if (view === 'weekly' && weekly) localStorage.setItem(`draft:data/weekly/${week}.json`, JSON.stringify(weekly));
+      if (view === 'projects' && projectFile) localStorage.setItem(`${storageMode}:draft:${projectFile.path}`, JSON.stringify(projectFile.data));
+      if (view === 'weekly' && weekly) localStorage.setItem(`${storageMode}:draft:data/weekly/${week}.json`, JSON.stringify(weekly));
       setSync('本地已保存');
     }, 700);
     setSync('未保存');
     return () => clearTimeout(timer);
-  }, [auth, view, projectFile, weekly, week]);
+  }, [auth, view, projectFile, weekly, week, storageMode]);
 
   useEffect(() => {
     const warn = (event: BeforeUnloadEvent) => {
@@ -337,7 +364,7 @@ export default function Home() {
           ...item, name: data.name, status: data.status, progress: data.progress, updatedAt: data.updatedAt,
         } : item);
         await saveIndex(projects, `同步项目概览：${data.name}`);
-        localStorage.removeItem(`draft:${projectFile.path}`);
+        localStorage.removeItem(`${storageMode}:draft:${projectFile.path}`);
       }
       if (view === 'weekly' && weekly) {
         const path = `data/weekly/${week}.json`;
@@ -352,7 +379,7 @@ export default function Home() {
         const result = await api.write(path, data, weeklySha, `${weeklySha ? '更新' : '新增'}周报：${week}`);
         setWeekly(data);
         setWeeklySha(result.sha);
-        localStorage.removeItem(`draft:${path}`);
+        localStorage.removeItem(`${storageMode}:draft:${path}`);
       }
       setSync('已保存');
       setMessage('保存成功');
@@ -492,10 +519,19 @@ export default function Home() {
     done: projectFile?.data.milestones.filter((item) => item.done).length || 0,
   }), [projectFile]);
   const selectedDaily = weekly?.dailyEntries.find((entry) => entry.date === dailyDate) || weekly?.dailyEntries[0];
+  const switchStorage = () => {
+    if (sync === '未保存' || sync === '本地已保存') {
+      setMessage('请先保存当前修改，再切换存储位置');
+      return;
+    }
+    void api.logout().catch(() => undefined);
+    setStorageMode('choose');
+  };
 
-  if (auth === 'loading') return <main className="loading-screen"><span className="brand-mark">迹</span><p>正在连接工作空间…</p></main>;
-  if (auth === 'setup') return <AccountSetup onReady={(name) => { setUsername(name); setAuth('in'); void loadIndex(); }} />;
-  if (auth === 'out') return <Login onLogin={(name) => { setUsername(name); setAuth('in'); void loadIndex(); }} />;
+  if (storageMode === 'choose') return <StorageChoice error={storageError} onSelect={connectStorage} />;
+  if (auth === 'loading') return <main className="loading-screen"><span className="brand-mark">迹</span><p>正在连接{storageMode === 'local' ? '本机' : '云端'}工作空间…</p></main>;
+  if (auth === 'setup') return <AccountSetup mode={storageMode} onReady={(name) => { setUsername(name); setAuth('in'); void loadIndex(); }} />;
+  if (auth === 'out') return <Login mode={storageMode} onLogin={(name) => { setUsername(name); setAuth('in'); void loadIndex(); }} />;
 
   return (
     <main className="app-shell">
@@ -514,6 +550,7 @@ export default function Home() {
           ))}
           {!indexFile.data.projects.length && <button className="project-row empty-row" onClick={() => setProjectDialog('new')}><Plus />创建第一个项目</button>}
         </section>
+        <button className="storage-switch" onClick={switchStorage}><span>{storageMode === 'local' ? <HardDrive /> : <Cloud />}{storageMode === 'local' ? '本机存储' : 'Cloudflare 云端'}</span><small>切换</small></button>
         <footer className="sidebar-footer"><span className="avatar">{username.slice(0, 2).toUpperCase()}</span><div><strong>{username}</strong><span>管理员</span></div><button aria-label="退出登录" onClick={async () => { await api.logout(); setAuth('out'); }}><LogOut /></button></footer>
       </aside>
 
@@ -523,6 +560,7 @@ export default function Home() {
           <div className="mobile-nav">
             <button aria-label="项目" className={view === 'projects' ? 'active' : ''} onClick={() => setView('projects')}><FolderKanban /></button>
             <button aria-label="周报" className={view === 'weekly' ? 'active' : ''} onClick={() => setView('weekly')}><CalendarDays /></button>
+            <button aria-label="切换存储位置" onClick={switchStorage}>{storageMode === 'local' ? <HardDrive /> : <Cloud />}</button>
             {view === 'projects' && indexFile.data.projects.length > 0 && <select aria-label="选择项目" onChange={(event) => setProjectId(event.target.value)} value={projectId}>{indexFile.data.projects.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>}
           </div>
           <label className="search-box"><Search /><input placeholder="搜索功能即将开放" disabled /></label>
@@ -584,7 +622,7 @@ export default function Home() {
                 <ReportEditor description="当前推进情况、关键数据和阶段变化。" label="项目进展" onChange={(progress) => setWeekly({ ...weekly, progress })} value={weekly.progress} />
                 <ReportEditor description="需要关注的风险、阻塞与所需协助。" label="问题与风险" onChange={(risks) => setWeekly({ ...weekly, risks })} value={weekly.risks} />
                 <ReportEditor description="下周计划和预期交付。" label="下周计划" onChange={(nextPlan) => setWeekly({ ...weekly, nextPlan })} value={weekly.nextPlan} />
-              </div><aside className="report-aside"><section className="progress-card"><span className="card-kicker">本周计划完成度</span><div className="progress-value"><strong>{weekly.completion}%</strong><span>{weekly.completion >= 80 ? '进展顺利' : weekly.completion >= 50 ? '持续推进' : '需要关注'}</span></div><Progress value={weekly.completion} /><input aria-label="本周完成度" max="100" min="0" onChange={(event) => setWeekly({ ...weekly, completion: Number(event.target.value) })} type="range" value={weekly.completion} /></section><section className="meta-card"><div><span>归档周期</span><strong>{weekLabel}</strong></div><div><span>关联项目</span><strong>{weekly.projectIds.length} 个</strong></div><div><span>存储方式</span><strong>按周独立记录</strong></div></section></aside></div>}
+              </div><aside className="report-aside"><section className="progress-card"><span className="card-kicker">本周计划完成度</span><div className="progress-value"><strong>{weekly.completion}%</strong><span>{weekly.completion >= 80 ? '进展顺利' : weekly.completion >= 50 ? '持续推进' : '需要关注'}</span></div><Progress value={weekly.completion} /><input aria-label="本周完成度" max="100" min="0" onChange={(event) => setWeekly({ ...weekly, completion: Number(event.target.value) })} type="range" value={weekly.completion} /></section><section className="meta-card"><div><span>归档周期</span><strong>{weekLabel}</strong></div><div><span>关联项目</span><strong>{weekly.projectIds.length} 个</strong></div><div><span>保存位置</span><strong>{storageMode === 'local' ? '本机 .local-data' : 'Cloudflare D1'}</strong></div></section></aside></div>}
             </>
           )}
         </div>
